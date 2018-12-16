@@ -1,0 +1,536 @@
+---
+title: "Predicting Housing Prices"
+authors: Mridul Gangwar
+output: html_document
+---
+
+###Overview
+What really predicts the price of a house? The [Kaggle competition](https://www.kaggle.com/c/house-prices-advanced-regression-techniques) our group selected contends that it is more than just the number of bedrooms or a white picket fence. Through data exploration and multiple models, our group aims to find the best model to predict the price of residential houses in Ames, Iowa. 
+
+Our data set has 79 explanatory variables, including lot shape, basement square footage and kitchen quality, in addition to the number of bedrooms and bathrooms typically used to assess pricing. We aim to use this data set to find a model that effectively predicts our continuous variable of interest, SalePrice. 
+
+
+#### Loading data and libraries
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(DataExplorer)
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(lattice)
+library(ModelMetrics)
+library(randomForest)
+library(xgboost)
+library(e1071)
+
+housing_data <- read.csv("train.csv")
+```
+
+### Exploratory Data Analysis
+
+First, we check how many missing values we have in our dataset. We then create a table that shows which variables are missing data and how much each is missing. We will want to remove any variables that have a lot of missing values, since they will not provide much useful information for our models.
+
+```{r pressure, echo=FALSE}
+glimpse(housing_data)
+plot_intro(housing_data)
+```
+
+```{r }
+NAcol <- which(colSums(is.na(housing_data)) > 0)
+sort(colSums(sapply(housing_data[NAcol], is.na)), decreasing = TRUE)
+```
+
+Based on the information above, we remove PoolQC, MiscFeature, Alley, Fence and FireplaceQu from our dataset as they offer little to no useful information.
+
+```{r}
+housing_data <- housing_data %>%
+                select(-c('PoolQC','MiscFeature','Alley','Fence','FireplaceQu'))
+```
+
+Now, we check the distribution of categorical variables. We will want to remove any that don't have much variance, since these will also not provide much useful information for our models.
+
+```{r}
+plot_bar(housing_data)
+```
+
+Looking at above figures, we identify 5 variables where we have only one value or more than 95% of the data has single value. From modelling perspective, these will not offer any distinctive information, so we can remove them as well. 
+
+```{r}
+table(housing_data$Street)
+table(housing_data$Utilities)
+table(housing_data$Condition2)
+table(housing_data$RoofMatl)
+table(housing_data$Heating)
+
+housing_data <- housing_data %>%
+                select(-c('Street','Utilities','Condition2','RoofMatl','Heating','Id'))
+```
+
+Now, we will check the distribution of numerical variables for the same thing. Variables with little to no variance will not be helpful for modelling. 
+
+```{r}
+plot_histogram(housing_data)
+```
+
+Looking through these histograms, we noticed there are few variables in which we have single value. Again, we remove these columns since they provide no additional value to our models. 
+
+```{r}
+housing_data <- housing_data %>%
+                select(-c('BsmtFinSF2','LowQualFinSF','X3SsnPorch','ScreenPorch','EnclosedPorch','PoolArea','MiscVal'))
+```
+
+Next, we want to further identify the predictors with zero or low variance. We are using nearZeroVar from the caret package to identify zero variance predictors. 
+
+```{r}
+remove_cols <- nearZeroVar(housing_data, names = TRUE, freqCut = 10, uniqueCut = 20)
+housing_data <- housing_data %>%
+                select(-remove_cols)
+```
+
+After our data exploration and cleaning, we are left with the 46 variables that will be most helpful in building predictive models. After looking at previous histograms we also realized that a lot of numeric columns need to be converted into factor variables, so we will do that before proceeding.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+
+factor_cols <- c("OverallQual","OverallCond","BsmtFullBath","FullBath","HalfBath","BedroomAbvGr","Fireplaces",
+                 "MoSold","YrSold") 
+housing_data <- housing_data %>%
+                    mutate_each_(funs(factor(.)),factor_cols)
+```
+
+In reviewing our target variable of interest, SalePrice, we noticed that the data is left-skewed. This makes sense, because we expect that many houses will sell at a lower price, while there will only be a few high-priced sales. 
+
+For the purposes of our modeling, we want to transform the data to a normal distribution so that we can more accurately predict the outcome. This will hopefully help prevent us from low-balling predictions on high-priced houses. 
+
+```{r}
+lSalePrice <- log(housing_data$SalePrice)
+ggplot(housing_data, aes(x = lSalePrice, fill = ..count..)) +
+  geom_histogram(binwidth = 0.05) +
+  ggtitle("Histogram of log SalePrice") +
+  ylab("Count of houses") +
+  xlab("Housing Price") 
+```
+
+Log transformation makes our target variable normal. We will be using log(SalePrice) in our predictive model.
+
+#### Univariate Analysis
+
+Now, we will continue our robust EDA process with some univariate analyses in graphical form. 
+
+```{r results='hide', message=FALSE, warning=FALSE}
+
+d1 <- housing_data %>% ggplot(aes(GrLivArea)) + geom_density(fill='#763626') + 
+  theme( plot.background = element_rect(fill = "#EFF2F4"),axis.text.y = element_blank(),
+         text = element_text(family = 'Ubuntu Condensed', face = 'plain', color = '#3A3F4A'))+ ylab("Density")
+
+d2 <- housing_data %>% ggplot(aes(TotalBsmtSF)) + geom_density(fill='#763626') +
+  theme( plot.background = element_rect(fill = "#EFF2F4"),axis.text.y = element_blank(),
+         text = element_text(family = 'Ubuntu Condensed', face = 'plain', color = '#3A3F4A'))+ ylab("Density")
+
+d3 <- housing_data %>% ggplot(aes(BsmtFinSF1)) + geom_density(fill='#763626') +
+  theme( plot.background = element_rect(fill = "#EFF2F4"),axis.text.y = element_blank(),
+         text = element_text(family = 'Ubuntu Condensed', face = 'plain', color = '#3A3F4A')) + ylab("Density")
+grid.arrange(arrangeGrob(d1,d2,d3))
+```
+
+As we can see, all three variables are left-skewed. We will normalize these variables during the modeling process.
+
+#### Bivariate Analysis
+
+Now we will summarize SalePrice by different categorical variables - Foundation type, House Style, Roof Style and Garage Type - to see how they are distributed with respect to one another.
+
+```{r}
+by(housing_data$SalePrice,housing_data$HouseStyle,summary)
+by(housing_data$SalePrice,housing_data$Foundation,summary)
+by(housing_data$SalePrice,housing_data$RoofStyle,summary)
+by(housing_data$SalePrice,housing_data$GarageType,summary)
+
+```
+
+Understandbly, 2.5 story, finished houses have the highest mean sale price of \$220,000. The houses with concrete foundations have the highest mean price of \$225,230. Similarly, houses with Shed roof style have the highest mean sale price of \$225,000 and Built-in Garage type has the highest mean price of \$254,752. 
+
+This type of analysis helps us understand some of the ways each factor can affect the variable of interest. 
+
+Now, we will do a similar graphical analysis with bivariate data. We made box plots of SalePrice by some of the categorical varaiables discussed above.
+
+```{r fig1, fig.width = 10, fig.asp = 1}
+options(scipen=999)
+
+p1 <- ggplot(housing_data, aes(x = HouseStyle, y = SalePrice)) +
+        geom_boxplot(colour = "black", fill = "#56B4E9") +
+        scale_y_continuous(name = "House Sale Price in dollars") +
+        scale_x_discrete(name = "House Style") +
+        ggtitle("Boxplot of Sale Price of House by House Style")
+
+p2 <- ggplot(housing_data, aes(x = RoofStyle, y = SalePrice)) +
+        geom_boxplot(colour = "black", fill = "#56B4E9") +
+        scale_y_continuous(name = "House Sale Price in dollars") +
+        scale_x_discrete(name = "Roof Style") +
+        ggtitle("Boxplot of Sale Price of House by Roof Style")
+
+p3 <- ggplot(housing_data, aes(x = Foundation, y = SalePrice)) +
+        geom_boxplot(colour = "black", fill = "#56B4E9") +
+        scale_y_continuous(name = "House Sale Price in dollars") +
+        scale_x_discrete(name = "Foundation Type") +
+        ggtitle("Boxplot of Sale Price of House by Foundation type")
+
+p4 <- ggplot(housing_data, aes(x = GarageType, y = SalePrice)) +
+        geom_boxplot(colour = "black", fill = "#56B4E9") +
+        scale_y_continuous(name = "House Sale Price in dollars") +
+        scale_x_discrete(name = "Garage Type") +
+        ggtitle("Boxplot of Sale Price of House by Garage type")
+grid.arrange(p1,p2,p3,p4,ncol=2)
+```
+
+2-story house prices have more outliers compared to others, although 2.5-story houses have highest mean. Houses with the Gable roof-style have more outliers in their sale prices, while the ones with shed-type roofs show very low variance in their prices. Houses with Concrete foundations (both poured and concrete block) have more outliers compared to other foundation types and prices of houses with stone-type foundations are left skewed. Houses with attached garages have more outliers than others.
+
+Now, let's look at how lot size, garage size, house age and the recency of remodeling change with housing prices.
+
+
+```{r}
+options(scipen=999)
+
+s1<-ggplot(housing_data, aes(LotArea, SalePrice)) +
+  geom_point(shape = 16, size = 1, color = "#336B87",show.legend = FALSE) +
+  theme_minimal() + xlab("Total Lot Area") + ylab("House Sale Price")
+  
+
+s2<-ggplot(housing_data, aes(YearBuilt, SalePrice)) +
+  geom_point(shape = 16, size = 1, color = "#336B87",show.legend = FALSE) +
+  theme_minimal() + xlab("Year Bulit") + ylab("House Sale Price")
+ 
+
+s3<-ggplot(housing_data, aes(YearRemodAdd, SalePrice)) +
+  geom_point(shape = 16, size = 1, color = "#336B87", show.legend = FALSE) +
+  theme_minimal() + xlab("Year Remodelled") + ylab("House Sale Price")
+ 
+
+s4<-ggplot(housing_data, aes(GrLivArea, SalePrice)) +
+  geom_point(shape = 16, size = 1, color = "#336B87",show.legend = FALSE) +
+  theme_minimal() + xlab("Garage Area") + ylab("House Sale Price")
+
+
+grid.arrange(s1,s2,s3,s4,ncol=2)
+```
+
+
+The houses which are built or remodeled recently seem to trend upwards in housing price, although there does not appear to be a significantly strong correlation, pointing to the idea that this will be just one contributing factor to overall SalePrice. The lot sizes show less of a correlation, as many houses appear to be on similarly sized lots. Finally, houses with more garage area do tend to sell for higher prices, indicating that this variable may be a good predictor for our models.
+
+
+#### Correlation Analysis
+
+In the final part of our EDA, we will use correlation plots to see which variables have the highest correlation with our outcome of interest.
+
+```{r}
+
+output <- housing_data$SalePrice
+num_features <- names(which(sapply(housing_data, is.numeric)))
+cat_feature <- names(which(sapply(housing_data, is.factor)))
+df.numeric <- housing_data[num_features]
+df.factor <- housing_data[cat_feature]
+
+correlations <- cor(df.numeric)
+# only want the columns that show strong correlations with SalePrice
+corr.SalePrice <- as.matrix(sort(correlations[,'SalePrice'], decreasing = TRUE))
+
+corr.idx <- names(which(apply(corr.SalePrice, 1, function(x) (x > 0.5 | x < -0.5))))
+
+corrplot(as.matrix(correlations[corr.idx,corr.idx]), type = 'upper', method='color', addCoef.col = 'black', 
+          tl.cex = .7,cl.cex = .7, number.cex=.7)
+```
+
+We reduced our corrplot to only showing variables with a correlation of 0.5 or more with the dependent variable. We expect these variables to be important and appear in our final model.
+
+
+### Data Manipulation and Feature Engineering
+
+In this section we explore some feature engineering - creating few more variables which we believe will help  predict housing prices even more accurately.
+
+
+We'll start with neighborhoods, identifying which tend to be more expensive.
+
+```{r }
+neighbourhood_data <- housing_data[,c('Neighborhood','SalePrice')] %>%
+  group_by(Neighborhood) %>%
+  summarise(mean.price = round(mean(SalePrice, na.rm = TRUE))) %>%
+  arrange(desc(mean.price))
+neighbourhood_data
+```
+
+Noridge, NridgeHt ,StoneBr , Timber and Veenker have higher mean housing prices than other neighbourhoods. We'll create a new variable that bins neighborhoods into three different categories, depending on their mean housing values. 
+
+```{r}
+housing_data$rich_neigh[housing_data$Neighborhood %in% c('StoneBr', 'NridgHt', 'NoRidge','Timber','Veenker')] <- 2
+housing_data$rich_neigh[!housing_data$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale', 'StoneBr', 'NridgHt', 'NoRidge','Timber','Veenker','BrkSide','Edwards')]<- 1
+housing_data$rich_neigh[housing_data$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale','BrkSide','Edwards')] <- 0
+```
+
+Next, we create another variable that captures the total square footage of the house, including living space and the basement area. This will give a better picture of how large the total house is. 
+
+```{r}
+housing_data$TotalSqFeet <- housing_data$GrLivArea + housing_data$TotalBsmtSF
+```
+
+We also want to include a binary variable indicating just whether the house was remodeled or not, and calculate teh age of each house when it sold based on the year built compared to the year sold. 
+
+```{r}
+housing_data$remodeled <- ifelse(housing_data$YearBuilt==housing_data$YearRemodAdd, 0, 1)
+housing_data$house_age <- as.numeric(housing_data$YrSold)-housing_data$YearRemodAdd
+```
+
+
+New houses who were sold the same year they were built could be an indicator that these houses were hot in the market, or otherwise different from their counterparts. Therefore we want to create a variable that identifies whether a house was sold as new.
+
+```{r}
+housing_data$NewHouse <- (housing_data$YearBuilt == housing_data$YrSold) * 1
+```
+
+Since housing sales and moving tend to be seasonal, let's explore in which months houses are typically sold.
+
+```{r}
+ggplot(housing_data, aes(x=as.numeric(MoSold))) +
+  geom_bar(fill = '#68829E') + xlab("Months Sold")+
+  geom_text(aes(label=..count..), stat='count', vjust = -.5) 
+```
+
+The largest proportion of houses sold is during the summer months: May, June, July. We are creating a variable to identify the summer season when maximum houses were sold.
+
+```{r}
+housing_data$highseason <- (housing_data$MoSold %in% c(5,6,7)) * 1
+```
+
+Now we will take care of removing skewness from our numeric variables which we have found out in our EDA. 
+
+```{r}
+outcome <- housing_data$SalePrice
+
+feature_classes <- sapply(names(housing_data),function(x){class(housing_data[[x]])})
+numeric_feats <-names(feature_classes[feature_classes != "factor"])
+
+# determine skew for each numeric feature
+skewed_feats <- sapply(numeric_feats,function(x){skewness(housing_data[[x]],na.rm=TRUE)})
+
+# keep only features that exceed a threshold for skewness
+skewed_feats <- skewed_feats[skewed_feats > 0.75]
+
+# transform excessively skewed features with log(x + 1)
+for(x in names(skewed_feats)) {
+  housing_data[[x]] <- log(housing_data[[x]] + 1)
+}
+housing_data$SalePrice <- outcome
+```
+
+
+Now we will remove all the variables from our model that we used to create these new variables. This will help us avoid the potential collinearity of factors that may affect our models' success. 
+
+```{r}
+housing_data <- housing_data %>%
+                select(-c(MoSold,YrSold,YearRemodAdd,Neighborhood))
+```
+
+Now we will just replace any missing values with a value and move forward to model-building! 
+```{r results='hide', message=FALSE, warning=FALSE}
+housing_data <- set_missing(housing_data, list(0L, "unknown"))
+```
+
+
+#### Model Preparation
+
+We begin our model preparation by dividing the data set into training and testing data, and transforming our outcome variable of interest. 
+
+```{r}
+set.seed(15)
+partition <- createDataPartition(y=outcome,p=.6,list=F)
+training.set <- housing_data[partition,]
+testing.set <- housing_data[-partition,]
+
+training.set$log_SalePrice <- log(training.set$SalePrice)
+training.set1 <- training.set %>% 
+  select(-SalePrice)
+testing.set$log_SalePrice <- log(testing.set$SalePrice)
+testing.set1 <- testing.set %>% 
+  select(-SalePrice)
+```
+
+We will now start with a linear model, looking at how each variable affects the dependent variable. 
+
+```{r}
+
+lm_model_full <- lm(log_SalePrice ~ ., data=training.set1)
+summary(lm_model_full)
+```
+
+Our adjusted R-squared of .9141 is very strong and a p-value of less than two indicates that our model is significant. 
+
+We can see how a new model performs when we drop a lot of variables that weren't predictive in the last version. We will use RMSE to check how our linear model with just these variables performs. 
+
+```{r warning=FALSE}
+lm_model <- lm(log_SalePrice ~ MSSubClass+MSZoning+LotArea+LotConfig+OverallQual+YearBuilt+
+                    MasVnrArea+remodeled+BsmtQual+X2ndFlrSF +FullBath+
+                    KitchenQual+GarageType+GarageFinish+
+                    SaleCondition+TotalSqFeet+highseason+BsmtFinSF1, data=training.set1)
+
+prediction <- predict(lm_model, testing.set1, type="response")
+model_output <- cbind(testing.set1, prediction)
+
+model_output$log_prediction <- model_output$prediction
+
+#Test with RMSE
+
+rmse(testing.set$log_SalePrice,model_output$log_prediction)
+```
+
+
+An RMSE of 0.1442 with a linear model is not bad. We will explore other models to decrease RMSE.
+
+Lets check the important variables using randomforest.
+
+```{r}
+set.seed(15)
+quick_RF <- randomForest(x=training.set1[1:878,-48], y=training.set1$log_SalePrice[1:878], ntree=100,importance=TRUE)
+imp_RF <- importance(quick_RF)
+imp_DF <- data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_DF <- imp_DF[order(imp_DF$MSE, decreasing = TRUE),]
+
+ggplot(imp_DF[1:20,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + geom_bar(stat = 'identity') + xlab('Variables')+
+  coord_flip() + theme(legend.position="none")+ggtitle("Important variables through Random Forest")
+```
+
+#### Linear Regression Model
+
+Again building a linear model, we are using all the variables identified by random forest and from the previous linear model. We will then check/compare the RMSE.
+
+```{r warning=FALSE}
+lm_model_rf <- lm(log_SalePrice ~ BsmtFinSF1+BsmtFinType1+BsmtQual+ExterQual+FullBath+GrLivArea+
+                              GarageArea+GarageCars+GarageFinish+GarageType+highseason+GarageYrBlt+Foundation+
+                              KitchenQual+LotArea+LotConfig+MSSubClass+MSZoning+OverallCond+rich_neigh+Fireplaces+
+                              OverallQual+remodeled+TotalSqFeet+X1stFlrSF+X2ndFlrSF +YearBuilt, data=training.set1)
+prediction <- predict(lm_model_rf, testing.set1, type="response")
+model_output <- cbind(testing.set1, prediction)
+
+model_output$log_prediction <- model_output$prediction
+
+#Test with RMSE
+rmse(testing.set1$log_SalePrice,model_output$log_prediction)
+```
+
+This RMSE is an improvement, with 0.1321 compared to 0.1442 in the previous linear model. 
+
+#### Models using H20 Library
+
+Next, we are exploring h2o library to explore more advance models. As a first step, we are creating a H2o cluster and a training and testing dataset suitable for H2o algorithm.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(h2o)
+localH2O <- h2o.init(nthreads = -1)
+h2o.init()
+train.h2o <- as.h2o(training.set1)
+test.h2o <- as.h2o(testing.set1)
+y.dep <- 48
+#columns we want to use for prediction
+x.indep <- c(22,21,19,16,30,28,40,39,38,36,47,37,18,33,4,6,1,2,9,42,35,8,44,43,26,27,10)
+```
+
+#### Random Forest using H20 library
+
+```{r}
+rforest.model <- h2o.randomForest(y=y.dep, x=x.indep, training_frame = train.h2o, ntrees = 1000, mtries = 3, max_depth = 4, seed = 15)
+predict.rforest <- as.data.frame(h2o.predict(rforest.model, test.h2o))
+
+model_output <- cbind(testing.set, predict.rforest$predict)
+
+model_output$log_prediction <- model_output$predict.rforest
+model_output$log_SalePrice <- log(model_output$SalePrice)
+
+rmse(model_output$log_SalePrice,model_output$log_prediction)
+```
+
+This RMSE actually got worse, so we will move forward to a different model. 
+
+#### GBM using H20 library
+
+```{r}
+gbm.model <- h2o.gbm(y=y.dep, x=x.indep, training_frame = train.h2o, ntrees = 1000, max_depth = 4, learn_rate = 0.01, seed = 15)
+
+predict.gbm <- as.data.frame(h2o.predict(gbm.model, test.h2o))
+
+model_output <- cbind(testing.set, predict.gbm$predict)
+
+model_output$log_prediction <- (model_output$predict.gbm)
+model_output$log_SalePrice <- log(model_output$SalePrice)
+
+rmse(model_output$log_SalePrice,model_output$log_prediction)
+```
+This is the best model yet, in terms of RMSE, with a value of 0.1314 compared to the previous best of .1321.
+
+#### XG Boost Model
+
+As a final step, we will look at the XG Boost model to see how well we can predict our outcome variable of interest.
+
+```{r warning=FALSE}
+set.seed(15)
+trainData<- as.matrix(training.set1, rownames.force=NA)
+testData<- as.matrix(testing.set1, rownames.force=NA)
+
+#Turn the matrices into sparse matrices
+train2 <- as(trainData, "sparseMatrix")
+test2 <- as(testData, "sparseMatrix")
+
+#columns we want to use for prediction 
+ 
+
+trainD <- xgb.DMatrix(data = train2[,x.indep], label = train2[,y.dep]) 
+
+default_param<-list(
+        objective = "reg:linear",
+        booster = "gbtree",
+        eta=0.05, #default = 0.3
+        gamma=0,
+        max_depth=3, #default=6
+        min_child_weight=4, #default=1
+        subsample=1,
+        colsample_bytree=.7
+)
+
+model_xgb <-
+  xgb.train(params =default_param,
+            data = trainD,
+            nrounds = 600,
+            watchlist = list(train = trainD),
+            verbose = TRUE,
+            print_every_n = 50,
+            nthread = 2)
+
+testD <- xgb.DMatrix(data = test2[,x.indep])
+prediction <- predict(model_xgb, testD) 
+
+#Put testing prediction and test dataset all together
+test3 <- as.data.frame(as.matrix(test2))
+prediction <- as.data.frame(as.matrix(prediction))
+colnames(prediction) <- "prediction"
+model_output <- cbind(test3, prediction)
+
+#Test with RMSE
+
+rmse(testing.set$log_SalePrice,model_output$prediction)
+```
+
+###Conclusion and Next Steps
+In the end we have four main models and performance of the models is mentioned below:<br>
+Linear Regression with identified important variables     RMSE: 0.1321<br>
+Random Forest model using H20 library                     RMSE: 0.1605<br>
+GBM model using H20 library                               RMSE: 0.1314<br>
+XG BOOST Model                                            RMSE: 0.1339<br>
+
+As we can see, the GBM model performed best among all other predictive models with respect to our performance measure of interests. We think that there is potential to better tune each of these models in order to get even better results, depending on the predictor's needs. Model stacking could also be used to get an even better RMSE. 
+
+In general, our models did well with respect to RMSE, given the range of values of our predicted variable. We would select the GBM model results to submit to the Kaggle competition. 
+
+More broadly, We would recommend the model to realtors in the Ames, IA area. By plugging in values of the important variables for a house they are listing, realtors could quickly and easily come up with an ideal list price. This would take a lot of the guesswork out of determining a price that isn't too high (risking scaring people away) but also isn't too low (risking not maximizing revenue for the seller). 
+
+This could also be used by owners who want to sell their home directly, without paying pricey realtor fees. Even though they don't have the knowledge of selling hundreds of houses, they would be able to price their house within reasonable range of what it should sell for. 
+
+For now, these results should not be generalized past Ames, IA, due to external validity concerns, but future applications could be done on data sets from different cities. A national data set would be even better, producing a pricing predictor of housing values in the U.S. for use in economic forecasts or the realtors/sellers as described above. 
+
